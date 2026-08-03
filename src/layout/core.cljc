@@ -235,6 +235,7 @@
   linear pass and nothing else. Stating what it does NOT model is the part
   that keeps it honest."
   {:model/id :kotoba.layout.cost/compulsory-lines-v1
+   :model/bounds :layout-only
    :model/counts [:cache-lines-filled :bytes-fetched :bytes-useful :sequential-streams]
    :model/assumes
    ["one linear pass over `count` elements, cold cache"
@@ -506,11 +507,24 @@
 (def roofline-model
   {:model/id :kotoba.layout.roofline/v1
    :model/rule "per-arm time = max(loop-ns-per-element * n, bytes-fetched / bandwidth)"
+   ;; Which lever this bounds, stated rather than left to be inferred. A bound
+   ;; constrains one lever, and comparing it against a measurement that moved a
+   ;; different one is not conservative, it is meaningless -- `paging` reports
+   ;; :bounds :replacement-only and `ioplan` :bounds :merging-and-ordering for
+   ;; the same reason, each after a planner appeared to beat its own floor.
+   :model/bounds :layout-only
    :model/assumes
    ["a loop has a floor cost per element that no layout can remove"
     "a machine delivers a finite bandwidth to the thread doing the fetching"
     "the two overlap perfectly, so the slower one is the whole cost"]
-   :model/does-not-model [:latency-bound-random-access :nuca :contention-between-threads]})
+   ;; Inherited, and worth restating: `bytes-fetched` comes from `cost`, which
+   ;; counts COMPULSORY lines. So this ratio cannot see a change that works by
+   ;; altering reuse rather than layout. Blocking is the obvious one -- measured
+   ;; clock-free on a matmul page trace, tiling moved miss counts by up to 23x,
+   ;; none of which is visible here. Feeding this a tiled-vs-untiled comparison
+   ;; asks a layout bound about a capacity lever.
+   :model/does-not-model [:latency-bound-random-access :nuca :contention-between-threads
+                          :capacity-misses :reuse-from-blocking]})
 
 (defn touch-stride-bytes
   "Distance in bytes between the items a pass consecutively touches.

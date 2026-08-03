@@ -345,3 +345,24 @@
                                       :candidate (l/soa m1max (wide-of 16))
                                       :n 1000 :access {:access/fields #{:f0}}
                                       :loop-ns-per-element 0.8})))))
+
+(deftest every-model-here-names-the-lever-it-bounds
+  (testing "a bound constrains one lever. Two libraries in this stack shipped a
+            floor a planner appeared to beat -- paging's replacement bound
+            against a prefetching cache, ioplan's merge floor against a plan
+            that bridges gaps -- and in both the bound was fine and the
+            comparison was not. Both now report the lever; these do too, so the
+            convention is checked rather than remembered"
+    (doseq [model [l/cost-model l/roofline-model]]
+      (is (= :layout-only (:model/bounds model))
+          (str (:model/id model) " does not say which lever it bounds")))))
+
+(deftest the-roofline-inherits-what-cost-cannot-see
+  (testing "bytes-fetched comes from cost, which counts compulsory lines only,
+            so the roofline ratio is blind to anything that works through reuse.
+            If cost stops disclaiming capacity misses, the roofline must stop
+            too, or the composed model quietly claims more than its input can
+            support"
+    (is (some #{:capacity-misses} (:model/does-not-model l/cost-model)))
+    (is (some #{:capacity-misses} (:model/does-not-model l/roofline-model))
+        "the composed model must inherit the disclosure of the model it consumes")))
