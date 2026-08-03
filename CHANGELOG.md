@@ -1,5 +1,33 @@
 # Changelog
 
+## 0.4.0 — 2026-08-03
+
+**Bug fix.** `cost` charged `ceil(element-bytes / line)` lines per AoS element
+unconditionally — "AoS pulls the whole struct". That holds while the struct
+fits a line or two, because the line holding one field also holds the
+neighbours the pass is about to touch. Past that it is false: reading one f64
+out of a 4 KiB element pulls **one** line, not thirty-two.
+
+The model over-counted a 4 KiB element by 32x and reported a 512x AoS/SoA ratio
+where 16x is the truth. Every fixture used elements of a line or less, so it
+never showed. Wide elements are now charged the lines their touched fields
+actually sit on; the narrow case keeps the span formula unchanged; and reading
+all fields of a wide element still gives `ceil(element/line)`, so the fix
+degrades correctly. All three are pinned by tests.
+
+**Documented.** `achievable-ratio`'s bandwidth input must match the stride
+being modelled. Measured here, one f64 touched every S bytes over 256 MiB:
+
+    stride  128 B  256 B  512 B  1 KiB  4 KiB  16 KiB  64 KiB
+    GB/s     24.1   29.7   27.6   34.3   14.5    11.5    14.2
+
+A 3x spread with the floor at the 16 KiB page size, where the TLB gives out.
+Handing the 34 GB/s figure to a plan about a page-strided walk is the error
+that made `traversal/tiling-benefit` v1 predict 1.00x against a measured 2.69x.
+
+19 tests, 86 assertions.
+
+
 ## 0.3.2 — 2026-08-03
 
 `achievable-ratio` now has a real test behind it. Constants measured

@@ -248,3 +248,34 @@
                                  :bandwidth-bytes-per-ns 18.5})]
       (is (:both-memory-bound? r))
       (is (< 15.9 (:achievable-ratio r) 16.1)))))
+
+;; ── wide elements: the bug the particle fixtures could not show ──────────
+
+(defn- wide-of [w] (mapv (fn [i] {:name (keyword (str "f" i)) :bytes 8 :align 8}) (range w)))
+
+(deftest reading-one-field-of-a-wide-element-pulls-one-line
+  (testing "a 4 KiB element on a 128-byte line: 32 lines per element would be
+            what reading the WHOLE struct costs, and this pass reads one f64"
+    (let [n 65536
+          access {:access/fields #{:f0} :access/stride 1}
+          a (l/cost m1max (l/aos m1max (wide-of 512)) n access)
+          s (l/cost m1max (l/soa m1max (wide-of 512)) n access)]
+      (is (= n (:cost/lines a)) "one line per element, not 32")
+      (is (= 16 (quot (:cost/lines a) (:cost/lines s)))))))
+
+(deftest narrow-elements-are-unchanged-by-the-fix
+  (testing "at or under a line, consecutive elements share lines and the span
+            formula is right — these are the numbers the fix must not move"
+    (let [n 65536
+          access {:access/fields #{:f0} :access/stride 1}]
+      (testing "32-byte element: four per line"
+        (is (= 16384 (:cost/lines (l/cost m1max (l/aos m1max (wide-of 4)) n access)))))
+      (testing "128-byte element: exactly one line each"
+        (is (= 65536 (:cost/lines (l/cost m1max (l/aos m1max (wide-of 16)) n access))))))))
+
+(deftest reading-every-field-of-a-wide-element-still-costs-the-whole-struct
+  (testing "the fix must degrade to the old answer when the pass really does
+            touch all of it"
+    (let [a (l/cost m1max (l/aos m1max (wide-of 512)) 1000
+                    {:access/fields #{} :access/stride 1})]
+      (is (= 32000 (:cost/lines a)) "ceil(4096/128) = 32 lines per element"))))

@@ -283,6 +283,21 @@
             clamps. See the held-out test below for the one that counts."}
     {:machine "Apple M1 Max/performance"
      :date "2026-08-03"
+     :bug-found true
+     :note "`cost` charged ceil(element-bytes / line) lines per AoS element
+            unconditionally -- \"AoS pulls the whole struct\". That holds while
+            the struct fits a line or two, because the line holding one field
+            also holds the neighbours the pass is about to touch. It is simply
+            false past that: reading one f64 out of a 4 KiB element pulls ONE
+            line, not thirty-two. The model over-counted a 4 KiB element by 32x
+            and reported a 512x AoS/SoA ratio where 16x is the truth. Every
+            fixture used elements of a line or less, so it never showed.
+            Fixed: wide elements are charged the lines their touched fields
+            actually sit on, and the narrow case keeps the span formula
+            unchanged. Reading ALL fields of a wide element still gives
+            ceil(element/line), so the fix degrades correctly."}
+    {:machine "Apple M1 Max/performance"
+     :date "2026-08-03"
      :held-out-test true
      :constants "loop floor 0.771 ns/element measured on a 16 KiB L1-resident
                  array; bandwidth 30.1 GB/s measured on a line-strided scan of
@@ -337,10 +352,33 @@
         touched (if (seq fields) (filterv #(contains? fields (:name %)) all) (vec all))
         ceil-div (fn [a b] (quot (+ a (dec b)) b))
         useful (* (ceil-div n stride) (reduce + 0 (map :bytes touched)))
+        ;; Lines an AoS element actually contributes.
+        ;;
+        ;; "AoS pulls the whole struct" is true only while the struct fits in
+        ;; a line or two -- then the line containing one field also contains
+        ;; the neighbours the pass is about to touch anyway. Past that it is
+        ;; simply false: reading one f64 out of a 4 KiB element pulls ONE
+        ;; line, not thirty-two. The old formula charged ceil(element/line)
+        ;; per element unconditionally and over-counted a 4 KiB element by
+        ;; 32x, which never showed because every fixture used elements of a
+        ;; line or less.
+        aos-lines-per-element
+        (fn [element-bytes]
+          (when (> element-bytes line)
+            (count (distinct (mapcat (fn [f]
+                                       (let [o (:offset f 0) b (:bytes f)]
+                                         (range (quot o line)
+                                                (inc (quot (dec (+ o b)) line)))))
+                                     touched)))))
         lines
         (case (:layout/kind plan)
-          ;; AoS pulls the whole struct whether or not the pass wants it.
-          :aos   (lines-for-strided-run n (:layout/element-bytes plan) stride line)
+          :aos   (let [e (:layout/element-bytes plan)]
+                   (if-let [per (aos-lines-per-element e)]
+                     ;; Wide element: only the lines the touched fields sit on.
+                     (* (ceil-div n stride) per)
+                     ;; Narrow element: consecutive elements share lines, so
+                     ;; the span formula is right and stays.
+                     (lines-for-strided-run n e stride line)))
           :soa   (reduce + 0 (map #(lines-for-strided-run n (:bytes %) stride line) touched))
           :aosoa (let [b (:layout/block plan)
                        blocks (ceil-div n b)
@@ -468,6 +506,19 @@
   already in registers. Measure it as the fastest arm's time divided by n.
   `bandwidth-bytes-per-ns` is what one thread actually observes, not the
   datasheet peak — those differ by more than an order of magnitude.
+
+  **`bandwidth-bytes-per-ns` must match the stride being modelled.** It is a
+  property of the machine AND the access pattern, never of the machine alone.
+  Measured on the machine this was calibrated against, one f64 touched every
+  S bytes over a 256 MiB working set:
+
+      stride    128 B   256 B   512 B   1 KiB   4 KiB   16 KiB   64 KiB
+      GB/s       24.1    29.7    27.6    34.3    14.5     11.5     14.2
+
+  A 3x spread, with the floor at the 16 KiB page size where the TLB gives out.
+  Handing the 34 GB/s figure to a plan about a page-strided walk is the same
+  error that made `traversal/tiling-benefit` v1 predict 1.00x where measurement
+  gave 2.69x.
 
   **Do not derive both inputs from the run you are explaining.** Taking
   `loop-ns-per-element` from the candidate arm and `bandwidth-bytes-per-ns`
