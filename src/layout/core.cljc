@@ -493,6 +493,31 @@
     "the two overlap perfectly, so the slower one is the whole cost"]
    :model/does-not-model [:latency-bound-random-access :nuca :contention-between-threads]})
 
+(defn touch-stride-bytes
+  "Distance in bytes between the items a pass consecutively touches.
+
+  **The two arms of a layout comparison do not share this.** Reading one field
+  of a 128-byte AoS element walks 128 bytes at a time; the same field in a SoA
+  walks 8. That is a different point on the machine's bandwidth curve — three
+  times apart on the part this was calibrated against — and handing both arms
+  one bandwidth figure is the error that made two models wrong in one
+  afternoon."
+  [plan access]
+  (let [stride (get access :access/stride 1)
+        fields (get access :access/fields)
+        touched (if (seq fields)
+                  (filterv #(contains? fields (:name %)) (:layout/fields plan))
+                  (:layout/fields plan))]
+    (* stride
+       (case (:layout/kind plan)
+         ;; A whole element is skipped per step whatever the pass reads.
+         :aos (:layout/element-bytes plan)
+         ;; Each field array is walked independently at its own width; the
+         ;; narrowest is the one whose stride is hardest on the prefetcher.
+         :soa (apply min (map :bytes touched))
+         ;; Within a block a field is contiguous, so the field width governs.
+         :aosoa (apply min (map :bytes touched))))))
+
 (defn achievable-ratio
   "The speedup a layout change can actually deliver, in time rather than bytes.
 
@@ -534,9 +559,23 @@
   [machine {:keys [baseline candidate n access loop-ns-per-element bandwidth-bytes-per-ns]}]
   (let [arm (fn [plan]
               (let [c (cost machine plan n access)
-                    mem-ns (/ (double (:cost/bytes-fetched c)) bandwidth-bytes-per-ns)
+                    stride-bytes (touch-stride-bytes plan access)
+                    ;; An explicit figure still wins -- a caller who measured
+                    ;; this exact pass knows better than a curve. Without one,
+                    ;; the machine's curve is read AT THIS ARM'S STRIDE rather
+                    ;; than shared with the other arm.
+                    bw (or bandwidth-bytes-per-ns
+                           (m/bandwidth-at-stride machine stride-bytes)
+                           (throw (ex-info "no bandwidth for this arm"
+                                           {:phase :layout/achievable-ratio
+                                            :machine/id (:machine/id machine)
+                                            :stride-bytes stride-bytes
+                                            :remedy "pass :bandwidth-bytes-per-ns, or give the machine a measured :bandwidth curve"})))
+                    mem-ns (/ (double (:cost/bytes-fetched c)) bw)
                     loop-ns (* loop-ns-per-element (double n))]
                 {:plan (:layout/kind plan)
+                 :stride-bytes stride-bytes
+                 :bandwidth-bytes-per-ns bw
                  :bytes-fetched (:cost/bytes-fetched c)
                  :memory-ns mem-ns
                  :loop-ns loop-ns

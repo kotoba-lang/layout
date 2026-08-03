@@ -1,5 +1,26 @@
 # Changelog
 
+## 0.5.0 — 2026-08-03
+
+`achievable-ratio` reads the machine's bandwidth curve **per arm**.
+
+The two arms of a layout comparison do not walk the same stride. Reading one
+field of a 128-byte AoS element skips 128 bytes a step; the same field in a SoA
+skips 8. At a 4 KiB element they are 4096 and 8 — opposite ends of the curve,
+15.3 GB/s against 6.2 on the machine this was calibrated against.
+
+Handing both arms one bandwidth figure is the error that made two models wrong
+in a single afternoon. `touch-stride-bytes` computes each arm's stride and the
+curve is read at it. An explicit `:bandwidth-bytes-per-ns` still wins, because
+a caller who measured this exact pass knows better than a curve; with neither a
+figure nor a curve it throws rather than defaulting, naming both remedies.
+
+Each arm reports the `:stride-bytes` and `:bandwidth-bytes-per-ns` it used, so
+the choice is visible rather than implied.
+
+23 tests, 99 assertions.
+
+
 ## 0.4.0 — 2026-08-03
 
 **Bug fix.** `cost` charged `ceil(element-bytes / line)` lines per AoS element

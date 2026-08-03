@@ -279,3 +279,69 @@
     (let [a (l/cost m1max (l/aos m1max (wide-of 512)) 1000
                     {:access/fields #{} :access/stride 1})]
       (is (= 32000 (:cost/lines a)) "ceil(4096/128) = 32 lines per element"))))
+
+;; ── the two arms do not share a bandwidth ────────────────────────────────
+
+(def ^:private m1max-curve
+  (assoc m1max :bandwidth
+         {:by-stride {128 6.2 256 6.1 512 7.9 1024 15.2 2048 23.8
+                      4096 15.3 8192 13.7 16384 10.6 32768 10.2}
+          :source "machine.bench/bandwidth-curve, 256 MiB working set"
+          :runtime :jvm}))
+
+(deftest each-arm-walks-a-different-stride
+  (let [access {:access/fields #{:f0} :access/stride 1}]
+    (testing "reading one f64 of a 128-byte AoS element skips 128 bytes a step"
+      (is (= 128 (l/touch-stride-bytes (l/aos m1max (wide-of 16)) access))))
+    (testing "the same field in a SoA walks 8"
+      (is (= 8 (l/touch-stride-bytes (l/soa m1max (wide-of 16)) access))))
+    (testing "and an access stride multiplies both"
+      (is (= 512 (l/touch-stride-bytes (l/aos m1max (wide-of 16))
+                                       (assoc access :access/stride 4)))))))
+
+(deftest the-curve-is-read-at-each-arm-s-own-stride
+  (let [r (l/achievable-ratio m1max-curve
+                              {:baseline (l/aos m1max-curve (wide-of 16))
+                               :candidate (l/soa m1max-curve (wide-of 16))
+                               :n 1000000
+                               :access {:access/fields #{:f0} :access/stride 1}
+                               :loop-ns-per-element 0.8})]
+    (testing "AoS at a 128-byte stride, SoA below the first measured point"
+      (is (= 128 (get-in r [:baseline :stride-bytes])))
+      (is (= 8 (get-in r [:candidate :stride-bytes]))))
+    (testing "so they get different figures off the same curve"
+      (is (= 6.2 (get-in r [:baseline :bandwidth-bytes-per-ns])))
+      (is (= 6.2 (get-in r [:candidate :bandwidth-bytes-per-ns]))))))
+
+(deftest a-wide-element-puts-the-arms-far-apart-on-the-curve
+  (testing "4 KiB elements: the AoS arm lands in the TLB-bound region while the
+            SoA arm is contiguous — 15.3 against 6.2, and sharing one figure
+            is exactly the mistake this wiring removes"
+    (let [r (l/achievable-ratio m1max-curve
+                                {:baseline (l/aos m1max-curve (wide-of 512))
+                                 :candidate (l/soa m1max-curve (wide-of 512))
+                                 :n 100000
+                                 :access {:access/fields #{:f0} :access/stride 1}
+                                 :loop-ns-per-element 0.8})]
+      (is (= 4096 (get-in r [:baseline :stride-bytes])))
+      (is (= 15.3 (get-in r [:baseline :bandwidth-bytes-per-ns])))
+      (is (= 6.2 (get-in r [:candidate :bandwidth-bytes-per-ns])))
+      (is (not= (get-in r [:baseline :bandwidth-bytes-per-ns])
+                (get-in r [:candidate :bandwidth-bytes-per-ns]))))))
+
+(deftest an-explicit-figure-still-wins-and-a-missing-curve-throws
+  (testing "a caller who measured this exact pass knows better than a curve"
+    (let [r (l/achievable-ratio m1max-curve
+                                {:baseline (l/aos m1max-curve (wide-of 16))
+                                 :candidate (l/soa m1max-curve (wide-of 16))
+                                 :n 1000 :access {:access/fields #{:f0}}
+                                 :loop-ns-per-element 0.8
+                                 :bandwidth-bytes-per-ns 30.0})]
+      (is (= 30.0 (get-in r [:baseline :bandwidth-bytes-per-ns])))))
+  (testing "and with neither, it says so rather than defaulting"
+    (is (thrown? #?(:clj clojure.lang.ExceptionInfo :cljs js/Error)
+                 (l/achievable-ratio m1max
+                                     {:baseline (l/aos m1max (wide-of 16))
+                                      :candidate (l/soa m1max (wide-of 16))
+                                      :n 1000 :access {:access/fields #{:f0}}
+                                      :loop-ns-per-element 0.8})))))
