@@ -298,7 +298,26 @@
             ceil(element/line), so the fix degrades correctly."}
     {:machine "Apple M1 Max/performance"
      :date "2026-08-03"
-     :held-out-test true
+     :per-arm-bandwidth-test true
+     :configuration "2e6 elements of 128 doubles (1 KiB), reading one field.
+                     1953 MiB as AoS against 15 MiB as SoA, JVM, curve measured
+                     on the same run."
+     :one-constant "predicted ratio 16.00x — 10% from measured"
+     :per-arm "predicted ratio 18.22x — 4% from measured"
+     :measured-ratio "17.56x"
+     :verdict "Per-arm lookup halves the ratio error. Real, and in the claimed
+               direction."
+     :how-weak-this-test-is
+     "Three things a reader should know before treating this as strong.
+      (1) The arms' bandwidths differed by only 1.14x here (6.3 against 7.2
+          GB/s) because the JVM curve is compressed at short strides — the
+          change was designed for the 2.5x gaps the C curve shows, and this
+          did not exercise that.
+      (2) The absolute times are 15-20% out under BOTH schemes; per-arm is
+          better on the ratio and slightly WORSE on the AoS arm alone (40.7 ms
+          predicted against 33.9 measured, where one constant gave 35.8).
+          `achievable-ratio` is named for the ratio and that is what improved.
+      (3) One configuration, one machine, one runtime."
      :constants "loop floor 0.771 ns/element measured on a 16 KiB L1-resident
                  array; bandwidth 30.1 GB/s measured on a line-strided scan of
                  a 45 MiB array. Different size, stride and element width from

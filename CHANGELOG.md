@@ -1,5 +1,19 @@
 # Changelog
 
+## 0.5.1 — 2026-08-03
+
+Measured whether 0.5.0's per-arm bandwidth lookup actually predicts better. It
+does, modestly: on 2e6 elements of 128 doubles reading one field, the ratio
+error goes from 10% (one constant) to 4% (per arm) against a measured 17.56x.
+
+Recorded with three reasons not to treat it as strong. The arms' bandwidths
+differed by only 1.14x here because the JVM curve is compressed at short
+strides, so this did not exercise the 2.5x gaps the change was designed for.
+The absolute times are 15-20% out under both schemes, and per-arm is slightly
+**worse** on the AoS arm alone while better on the ratio. And it is one
+configuration on one machine under one runtime.
+
+
 ## 0.5.0 — 2026-08-03
 
 `achievable-ratio` reads the machine's bandwidth curve **per arm**.
