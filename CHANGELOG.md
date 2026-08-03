@@ -1,5 +1,26 @@
 # Changelog
 
+## 0.3.1 — 2026-08-03
+
+**Correction.** The agreements between `achievable-ratio` and measurement
+reported in 0.3.0 are not validations. Both inputs were derived from the two
+arms being explained — the loop floor from the candidate, the bandwidth from
+the baseline — so the formula returns their ratio by construction wherever
+neither term clamps. The model may be right; nothing so far has tested it.
+`achievable-ratio`'s docstring now says so, and says what an honest test would
+need: an L1-resident loop-floor measurement and a separate streaming-bandwidth
+measurement, used to predict a configuration nobody measured.
+
+New calibration point, and this one is a real measurement. The serial
+summation loop ran at floating-point add *latency* — 2.87 ns/element for one
+load and one add, about ten cycles — because every add waited on the previous
+one. Four independent accumulators took it to 0.87 ns and moved the measured
+AoS/SoA ratio from 2.12x to 6.63x. **The layout was never what was being
+measured; the dependency chain was.** At n=8e6 the same change reached 20.2x,
+*above* the byte model's 16x, because a 1 GiB array exhausts TLB reach — the
+other direction, and also on the not-modelled list.
+
+
 ## 0.3.0 — 2026-08-03
 
 `achievable-ratio` — the missing step from bytes to time.

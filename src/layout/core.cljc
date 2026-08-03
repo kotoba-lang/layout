@@ -263,6 +263,29 @@
             speedup, not an estimate of it."}
     {:machine "Apple M1 Max/performance"
      :date "2026-08-03"
+     :workload "same 16-wide element, loop rewritten with four independent accumulators"
+     :measured-wall-ratio 6.63
+     :note "The serial loop ran at floating-point add LATENCY, because every
+            add waited on the previous one -- 2.87 ns/element for one load and
+            one add, about ten cycles. Four independent accumulators took it to
+            0.87 ns and moved the measured AoS/SoA ratio from 2.12x to 6.63x.
+            The layout was never the thing being measured; the dependency
+            chain was. At n=8e6 the same change reached 20.2x, ABOVE the byte
+            model's 16x, because a 1 GiB array runs out of TLB reach -- an
+            effect this model also declines to model, in the other direction."}
+    {:machine "Apple M1 Max/performance"
+     :date "2026-08-03"
+     :correction true
+     :note "The 2.02x and 6.63x agreements between `achievable-ratio` and
+            measurement, reported earlier the same day, are NOT validations.
+            Both inputs were derived from the two arms being explained, so the
+            formula returns their ratio by construction wherever neither term
+            clamps. The model may well be right; nothing here has tested it.
+            An honest test needs an L1-resident loop-floor measurement and a
+            separate streaming-bandwidth measurement, used to predict a
+            configuration that was not measured."}
+    {:machine "Apple M1 Max/performance"
+     :date "2026-08-03"
      :workload "same, but 4 doubles per AoS element (32 B)"
      :predicted-line-ratio 4.0
      :measured-wall-ratio 1.01
@@ -427,6 +450,15 @@
   already in registers. Measure it as the fastest arm's time divided by n.
   `bandwidth-bytes-per-ns` is what one thread actually observes, not the
   datasheet peak — those differ by more than an order of magnitude.
+
+  **Do not derive both inputs from the run you are explaining.** Taking
+  `loop-ns-per-element` from the candidate arm and `bandwidth-bytes-per-ns`
+  from the baseline arm makes this reproduce those two timings by
+  construction — an identity dressed as a prediction, and it was reported as
+  a successful validation here on 2026-08-03 before the circularity was
+  noticed. To actually test the model, measure the loop floor on a working
+  set that fits in L1 (where memory is free) and the bandwidth on a streaming
+  read, then predict an unseen configuration.
 
   Both are measurements, so this returns a ceiling you can check against a
   `perfgate` claim rather than a number to quote."
