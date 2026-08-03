@@ -243,6 +243,35 @@
     "no TLB, no NUMA, no DRAM row-buffer effects"]
    :model/does-not-model
    [:capacity-misses :conflict-misses :prefetch :write-allocate :store-buffers :tlb :numa]
+   ;; Measured, not asserted. The line ratio is an UPPER BOUND on the wall-clock
+   ;; ratio, and on a machine with a deep prefetcher and bandwidth to spare the
+   ;; realized fraction is small. Recorded here with the machine it was taken
+   ;; on, because a calibration without one is the fossil this stack exists to
+   ;; prevent.
+   :model/calibration
+   [{:machine "Apple M1 Max/performance (128 B line, 16 KiB page, 12 MiB L2 shared by 4)"
+     :date "2026-08-03"
+     :workload "sequential sum of one f64 field, 2e6 elements, 16 doubles per AoS element"
+     :predicted-line-ratio 16.0
+     :measured-wall-ratio 2.02
+     :realized-fraction 0.126
+     :note "The model does not model prefetch, and this is what that costs. A
+            sequential scan lets the hardware prefetcher hide the latency, so
+            only the bandwidth difference survives -- and on 400 GB/s there is
+            enough of it that 244 MiB versus 16 MiB is a 2x wall-clock gap, not
+            a 16x one. Treat :cost/lines as a ceiling on the achievable
+            speedup, not an estimate of it."}
+    {:machine "Apple M1 Max/performance"
+     :date "2026-08-03"
+     :workload "same, but 4 doubles per AoS element (32 B)"
+     :predicted-line-ratio 4.0
+     :measured-wall-ratio 1.01
+     :realized-fraction 0.0025
+     :note "At this element width the layout difference is not measurable at
+            all: the loop cost per element is roughly fifty times the memory
+            cost, so the memory system never becomes the bottleneck. perfgate
+            refused the claim, which is the correct outcome and the reason to
+            keep the refusal path."}]
    :model/known-consequences
    [;; Worth stating, because it is the result people expect to be false.
     "With NO struct padding and a pass that touches EVERY field, AoS and SoA
