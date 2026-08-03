@@ -280,10 +280,28 @@
             measurement, reported earlier the same day, are NOT validations.
             Both inputs were derived from the two arms being explained, so the
             formula returns their ratio by construction wherever neither term
-            clamps. The model may well be right; nothing here has tested it.
-            An honest test needs an L1-resident loop-floor measurement and a
-            separate streaming-bandwidth measurement, used to predict a
-            configuration that was not measured."}
+            clamps. See the held-out test below for the one that counts."}
+    {:machine "Apple M1 Max/performance"
+     :date "2026-08-03"
+     :held-out-test true
+     :constants "loop floor 0.771 ns/element measured on a 16 KiB L1-resident
+                 array; bandwidth 30.1 GB/s measured on a line-strided scan of
+                 a 45 MiB array. Different size, stride and element width from
+                 the configuration predicted."
+     :predicted "4e6 elements x 8 doubles, reading one field: AoS 8.501 ms,
+                 SoA 3.084 ms, ratio 2.76x"
+     :measured "AoS 6.848 ms, SoA 2.804 ms, ratio 2.44x"
+     :error "AoS -19.4%, SoA -9.1%, ratio -11.4% (the model over-predicts both
+             arms, so it errs toward pessimism)"
+     :note "This one is a real test: the constants came from measurements the
+            predicted configuration does not share, so the formula could have
+            been wrong and was not. It failed first at 65%, and the fault was
+            the calibration rather than the model — bandwidth had been measured
+            with a contiguous f64 sum, whose 8-byte-per-iteration loop caps at
+            10.4 GB/s and therefore reports the loop floor in different units.
+            Measure bandwidth where the loop is NOT the bottleneck.
+            Within 19% on held-out data, `achievable-ratio` is usable as a
+            planning estimate and not merely as a ceiling."}
     {:machine "Apple M1 Max/performance"
      :date "2026-08-03"
      :workload "same, but 4 doubles per AoS element (32 B)"

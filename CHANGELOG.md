@@ -1,5 +1,37 @@
 # Changelog
 
+## 0.3.2 — 2026-08-03
+
+`achievable-ratio` now has a real test behind it. Constants measured
+independently — loop floor on an L1-resident array, bandwidth on a line-strided
+scan of a differently-sized one — predicted a configuration neither touched, to
+within 19% (erring pessimistic). Recorded in `:model/calibration` as
+`:held-out-test`.
+
+The first attempt missed by 65%, and the fault was the calibration rather than
+the model: bandwidth measured with a contiguous f64 sum reports the loop floor
+in different units, because 8 bytes per iteration at 0.77 ns caps at 10.4 GB/s.
+
+
+## 0.4.0 — 2026-08-03 (second entry)
+
+The held-out test `achievable-ratio` was owed.
+
+`loop-floor-ns` measures the loop on a 16 KiB L1-resident array, where memory
+is free. `bandwidth-bytes-per-ns` measures a **line-strided** scan of a 45 MiB
+array, where the loop is amortised over a whole cache line per touch. Neither
+shares a size, stride or element width with the configuration then predicted.
+
+Result: predicted AoS 8.501 ms / SoA 3.084 ms for 4e6 elements of 8 doubles;
+measured 6.848 / 2.804. Within 19%, erring toward pessimism.
+
+**It failed first, at 65%, and the fault was the calibration.** Bandwidth had
+been measured with a contiguous f64 sum — 8 bytes per iteration at 0.77 ns caps
+at 10.4 GB/s, so what came back was the loop floor in different units, and the
+model duly over-predicted the AoS arm by 2.9x. Measure bandwidth where the loop
+is not the bottleneck.
+
+
 ## 0.3.1 — 2026-08-03
 
 **Correction.** The agreements between `achievable-ratio` and measurement
