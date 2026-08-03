@@ -1,0 +1,375 @@
+(ns layout.core
+  "Where the bytes of an aggregate go, planned against a real machine.
+
+  The canonical example: a particle with `x y z mass`. Held as an array of
+  structs, a pass that reads only `x` still pulls `y z mass` into every cache
+  line it touches. Held as a struct of arrays, `x` is contiguous and the line
+  is all payload. Neither is universally right — a pass that touches *every*
+  field of one element wants the struct back — so this namespace does not
+  pick a winner in the abstract. It computes what each layout costs for a
+  stated access pattern on a stated machine, and reports the model it used.
+
+  Two things here are not decoration.
+
+  **The cost model is a value.** `cost` returns `:cost/model` alongside the
+  numbers, and `recommend` returns the losers as well as the winner. A layout
+  choice whose justification cannot be printed is how a team ends up with an
+  optimization nobody can re-derive and nobody dares delete.
+
+  **Reordering fields breaks the ABI.** Sorting fields by descending
+  alignment is the standard way to squeeze padding out of a struct, and it
+  changes the byte offsets that `kotoba-wasm`'s Canonical ABI fixes by
+  declaration order. So every plan carries `:layout/abi-canonical?` and
+  `:layout/scope`, and `abi-guard!` throws rather than letting an
+  internal-only layout leak across a component boundary. Silently shipping a
+  reordered struct through a Canonical ABI lift is a wire-format bug that
+  presents as data corruption.
+
+  Pure `.cljc`. Depends only on `kotoba-lang/machine`."
+  (:require [machine.core :as m]))
+
+(def format-id :kotoba.layout/v1)
+
+(def kinds
+  "`:aos` array-of-structs, `:soa` struct-of-arrays, `:aosoa` blocked hybrid."
+  #{:aos :soa :aosoa})
+
+;; ── field checking ───────────────────────────────────────────────────────
+
+(defn- pow2? [n] (and (integer? n) (pos? n) (zero? (bit-and n (dec n)))))
+
+(defn field-errors
+  "Every reason `fields` is not a usable field list."
+  [fields]
+  (vec
+   (concat
+    (when-not (and (vector? fields) (seq fields))
+      [{:error :empty-field-list :fields fields}])
+    (when (and (vector? fields) (seq fields))
+      (concat
+       (for [[i f] (map-indexed vector fields)
+             e (cond-> []
+                 (not (keyword? (:name f)))  (conj :invalid-field-name)
+                 (not (pos-int? (:bytes f))) (conj :invalid-field-bytes)
+                 (not (pow2? (:align f)))    (conj :invalid-field-align))]
+         {:error e :index i :field f})
+       (let [names (map :name fields)]
+         (when-not (= (count names) (count (set names)))
+           [{:error :duplicate-field-name :names (vec names)}])))))))
+
+(defn- check-fields! [fields]
+  (let [errs (field-errors fields)]
+    (when (seq errs)
+      (throw (ex-info "invalid field list" {:phase :layout/fields :errors errs})))
+    fields))
+
+(defn- align-up [v a] (* a (quot (+ v (dec a)) a)))
+
+(defn- line!
+  "The line width, or a throw naming what was missing. Planners must ask out
+  loud rather than defaulting to 64 — see `machine.core/require-fact`."
+  [machine]
+  (m/require-fact machine [:cpu :cache] "a cache hierarchy (needed for line width)")
+  (or (m/line-bytes machine)
+      (throw (ex-info "machine declares caches but no line width"
+                      {:phase :layout/line :machine/id (:machine/id machine)}))))
+
+;; ── the three layouts ────────────────────────────────────────────────────
+
+(defn- pack
+  "Lay `fields` out consecutively with natural alignment."
+  [fields]
+  (let [{:keys [placed end]}
+        (reduce (fn [acc f]
+                  (let [off (align-up (:end acc) (:align f))]
+                    {:placed (conj (:placed acc) (assoc f :offset off))
+                     :end (+ off (:bytes f))}))
+                {:placed [] :end 0}
+                fields)
+        agg-align (apply max (map :align fields))
+        payload (reduce + (map :bytes fields))
+        size (align-up end agg-align)]
+    {:fields placed :align agg-align :size size
+     :payload-bytes payload :padding-bytes (- size payload)}))
+
+(defn- by-descending-alignment
+  "Stable: ties keep declaration order, so the packing is deterministic."
+  [fields]
+  (->> (map-indexed (fn [i f] [i f]) fields)
+       (sort-by (fn [[i f]] [(- (:align f)) i]))
+       (mapv second)))
+
+(defn aos
+  "Array of structs.
+
+  `:reorder? true` sorts fields by descending alignment before packing — the
+  standard padding squeeze — which makes the plan NOT ABI-canonical.
+
+  `:pad-to-line? true` rounds the struct up to a full cache line. That is the
+  false-sharing fix when distinct threads write distinct elements, and it is
+  a memory-footprint tax the plan reports rather than hides."
+  ([machine fields] (aos machine fields {}))
+  ([machine fields {:keys [reorder? pad-to-line?] :or {reorder? false pad-to-line? false}}]
+   (check-fields! fields)
+   (let [packed (pack (if reorder? (by-descending-alignment fields) fields))
+         line (when pad-to-line? (line! machine))
+         size (if pad-to-line? (align-up (:size packed) line) (:size packed))
+         canonical? (and (not reorder?) (not pad-to-line?))]
+     {:format format-id
+      :layout/kind :aos
+      :layout/fields (:fields packed)
+      :layout/align (if pad-to-line? (max (:align packed) line) (:align packed))
+      :layout/element-bytes size
+      :layout/write-stride-bytes size
+      :layout/payload-bytes (:payload-bytes packed)
+      :layout/padding-bytes (- size (:payload-bytes packed))
+      :layout/abi-canonical? canonical?
+      :layout/scope (if canonical? :abi-boundary :internal-only)
+      :layout/machine (:machine/id machine)})))
+
+(defn soa
+  "Struct of arrays: one array per field, each array base aligned to a line so
+  a scan of one field never straddles into another's."
+  [machine fields]
+  (check-fields! fields)
+  (let [line (line! machine)
+        payload (reduce + (map :bytes fields))]
+    {:format format-id
+     :layout/kind :soa
+     :layout/fields (mapv #(assoc % :array-align line) fields)
+     :layout/align line
+     :layout/element-bytes payload
+     ;; Two threads writing the same field of adjacent elements are
+     ;; `bytes` apart, not `element-bytes` apart. That distance, not the
+     ;; struct size, is what decides false sharing here.
+     :layout/write-stride-bytes (apply min (map :bytes fields))
+     :layout/payload-bytes payload
+     :layout/padding-bytes 0
+     ;; A struct-of-arrays has no struct, so there is nothing for a Canonical
+     ;; ABI record lift to point at. Internal by construction, not by choice.
+     :layout/abi-canonical? false
+     :layout/scope :internal-only
+     :layout/machine (:machine/id machine)}))
+
+(defn default-block
+  "Block width for `aosoa`.
+
+  Chosen so each field's sub-array is a whole number of cache lines:
+  `line / narrowest-field`. That holds exactly when field widths are
+  multiples of the narrowest, which is the normal case (1/2/4/8). Floored at
+  the SIMD lane count for the widest field, so one block always holds at
+  least one full vector operation's worth."
+  [machine fields]
+  (let [line (m/line-bytes machine)
+        narrowest (apply min (map :bytes fields))
+        widest (apply max (map :bytes fields))
+        lanes (m/simd-lanes machine widest)]
+    (max 1
+         (or lanes 1)
+         (if line (quot line narrowest) 1))))
+
+(defn aosoa
+  "Blocked hybrid: `block` elements' worth of each field, contiguous, then the
+  next field. Keeps a field's values adjacent inside a block (so a lane-wide
+  load is one line) while keeping a whole element inside one block (so a
+  full-element pass stays local)."
+  ([machine fields] (aosoa machine fields nil))
+  ([machine fields block]
+   (check-fields! fields)
+   (let [block (or block (default-block machine fields))
+         _ (when-not (pos-int? block)
+             (throw (ex-info "aosoa block must be a positive integer"
+                             {:phase :layout/aosoa :block block})))
+         line (line! machine)
+         subs (reduce (fn [acc f]
+                        (let [off (align-up (:end acc) (:align f))]
+                          {:placed (conj (:placed acc)
+                                         (assoc f :block-offset off
+                                                  :block-bytes (* block (:bytes f))))
+                           :end (+ off (* block (:bytes f)))}))
+                      {:placed [] :end 0}
+                      fields)
+         block-bytes (align-up (:end subs) line)
+         payload (reduce + (map :bytes fields))]
+     {:format format-id
+      :layout/kind :aosoa
+      :layout/block block
+      :layout/fields (:placed subs)
+      :layout/align line
+      :layout/block-bytes block-bytes
+      ;; Amortized, and a double on purpose: block padding rarely divides
+      ;; evenly by the block width, and rounding it to an integer would
+      ;; understate the footprint of a small block.
+      :layout/element-bytes (double (/ block-bytes block))
+      :layout/write-stride-bytes (apply min (map :bytes fields))
+      :layout/payload-bytes payload
+      :layout/padding-bytes (- (double (/ block-bytes block)) payload)
+      :layout/abi-canonical? false
+      :layout/scope :internal-only
+      :layout/machine (:machine/id machine)})))
+
+;; ── cost ─────────────────────────────────────────────────────────────────
+
+(defn lines-for-strided-run
+  "Cache lines pulled by touching every `step`-th of `n` items of `width`
+  bytes laid consecutively.
+
+  Two regimes, and the boundary between them is the whole point of a stride:
+
+  - `step * width >= line` — touched items land on distinct lines, so each
+    costs its own `ceil(width/line)`. This is where a stride gets expensive:
+    you pay for the bytes you skipped.
+  - otherwise — consecutive touched items share lines, so the run costs the
+    whole span. Skipping is free here, because the line came in anyway."
+  [n width step line]
+  (let [n (max 0 n)
+        ceil-div (fn [a b] (quot (+ a (dec b)) b))]
+    (cond
+      (zero? n) 0
+      (>= (* step width) line) (* (ceil-div n step) (ceil-div width line))
+      :else (ceil-div (* n width) line))))
+
+(def cost-model
+  "The model `cost` applies, as data, so a layout decision can print its own
+  justification. Deliberately coarse: it counts compulsory line fills for one
+  linear pass and nothing else. Stating what it does NOT model is the part
+  that keeps it honest."
+  {:model/id :kotoba.layout.cost/compulsory-lines-v1
+   :model/counts [:cache-lines-filled :bytes-fetched :bytes-useful :sequential-streams]
+   :model/assumes
+   ["one linear pass over `count` elements, cold cache"
+    "a line fetched once is not refetched (no capacity or conflict misses)"
+    "no hardware-prefetch credit, so a sequential AoS pass is charged pessimistically"
+    "no TLB, no NUMA, no DRAM row-buffer effects"]
+   :model/does-not-model
+   [:capacity-misses :conflict-misses :prefetch :write-allocate :store-buffers :tlb :numa]
+   :model/known-consequences
+   [;; Worth stating, because it is the result people expect to be false.
+    "With NO struct padding and a pass that touches EVERY field, AoS and SoA
+     fetch exactly the same bytes — this model cannot separate them. The
+     separation appears only when the pass touches a subset, or when the
+     struct carries padding SoA does not pay."
+    ;; And the reason a line count alone must not decide the matter.
+    "A line count says nothing about how many concurrent sequential streams a
+     layout opens. Hardware prefetchers track a bounded number of them, so a
+     SoA over many fields is not free even where the line count says it is —
+     hence `:cost/streams`."]})
+
+(defn cost
+  "What one pass of `access` over `n` elements costs under `plan`.
+
+  `access` is `{:access/fields #{…} :access/stride k}`; an empty or absent
+  field set means the pass touches every field. `:cost/utilization` — useful
+  bytes over fetched bytes — is the number that actually decides layouts."
+  [machine plan n {:access/keys [fields stride] :or {stride 1}}]
+  (let [line (line! machine)
+        all (:layout/fields plan)
+        touched (if (seq fields) (filterv #(contains? fields (:name %)) all) (vec all))
+        ceil-div (fn [a b] (quot (+ a (dec b)) b))
+        useful (* (ceil-div n stride) (reduce + 0 (map :bytes touched)))
+        lines
+        (case (:layout/kind plan)
+          ;; AoS pulls the whole struct whether or not the pass wants it.
+          :aos   (lines-for-strided-run n (:layout/element-bytes plan) stride line)
+          :soa   (reduce + 0 (map #(lines-for-strided-run n (:bytes %) stride line) touched))
+          :aosoa (let [b (:layout/block plan)
+                       blocks (ceil-div n b)
+                       per-block (reduce + 0 (map #(lines-for-strided-run b (:bytes %) stride line)
+                                                  touched))]
+                   (* blocks per-block)))]
+    {:cost/lines lines
+     :cost/bytes-fetched (* lines line)
+     :cost/bytes-useful useful
+     :cost/utilization (if (pos? lines) (double (/ useful (* lines line))) 0.0)
+     ;; Concurrent sequential streams the pass opens. One for AoS and AoSoA
+     ;; (the walk stays inside one region); one per touched field for SoA.
+     ;; A prefetcher tracks a bounded number, so this is where a wide SoA
+     ;; stops being free even when `:cost/lines` says it is.
+     :cost/streams (case (:layout/kind plan)
+                     :soa (count touched)
+                     1)
+     :cost/model cost-model
+     :cost/machine (:machine/id machine)}))
+
+(defn recommend
+  "Cost every candidate layout for this access pattern and return them ranked,
+  cheapest first — with the losers attached.
+
+  Returning the alternatives is the point. A bare answer (\"use SoA\") is
+  unfalsifiable six months later; a ranked list with a printed model can be
+  re-derived, argued with, and invalidated when the access pattern changes."
+  [machine fields n access]
+  (check-fields! fields)
+  (let [candidates [[:aos (aos machine fields)]
+                    [:aos-reordered (aos machine fields {:reorder? true})]
+                    [:soa (soa machine fields)]
+                    [:aosoa (aosoa machine fields)]]
+        scored (mapv (fn [[id plan]]
+                       {:candidate id :plan plan :cost (cost machine plan n access)})
+                     candidates)
+        ;; Fewest lines first; then fewest prefetch streams, because a tie on
+        ;; bytes is broken by the thing this model cannot price; then least
+        ;; padding; then the name, so the ranking is total and deterministic.
+        ranked (vec (sort-by (juxt (comp :cost/lines :cost)
+                                   (comp :cost/streams :cost)
+                                   (comp double :layout/padding-bytes :plan)
+                                   (comp name :candidate))
+                             scored))]
+    {:format format-id
+     :recommend/access access
+     :recommend/count n
+     :recommend/chosen (first ranked)
+     :recommend/ranked ranked
+     :recommend/model cost-model}))
+
+;; ── false sharing ────────────────────────────────────────────────────────
+
+(defn false-sharing-risk
+  "Do distinct threads writing distinct elements collide on a line?
+
+  The distance that matters is `:layout/write-stride-bytes` — how far apart
+  two threads' writes land — which is the struct size for AoS but the field
+  width for SoA and AoSoA. Risk exists only when that distance is under a
+  line, which is the common case, and why the symptom (a parallel loop that
+  gets *slower* with more threads) is so often misread as lock contention."
+  [machine plan {:keys [concurrent-writers] :or {concurrent-writers 1}}]
+  (let [line (m/line-bytes machine)
+        w (:layout/write-stride-bytes plan)]
+    (cond
+      (nil? line) {:risk :unknown :reason :machine-declares-no-line-width}
+      (<= concurrent-writers 1) {:risk :none :reason :single-writer}
+      (>= w line) {:risk :none :reason :write-stride-spans-a-line
+                   :write-stride-bytes w :line-bytes line}
+      :else {:risk :present
+             :reason :multiple-writes-share-a-line
+             :writes-per-line (quot line w)
+             :write-stride-bytes w :line-bytes line
+             :fix :pad-to-line
+             :footprint-multiplier (double (/ line w))})))
+
+;; ── ABI boundary ─────────────────────────────────────────────────────────
+
+(defn abi-canonical?
+  "May this plan describe bytes that cross a Canonical ABI boundary?
+
+  Only a declaration-ordered, unpadded AoS may. Anything else has moved or
+  spread the fields, and a Canonical ABI lift reading it as a record would
+  read the wrong offsets."
+  [plan]
+  (boolean (:layout/abi-canonical? plan)))
+
+(defn abi-guard!
+  "Throw unless `plan` may cross a component boundary.
+
+  Call this at the lift/lower site, not at the plan site. An internal layout
+  is a legitimate thing to have — it just may not be the thing one component
+  hands to another."
+  [plan where]
+  (when-not (abi-canonical? plan)
+    (throw (ex-info "non-canonical layout at an ABI boundary"
+                    {:phase :layout/abi-guard
+                     :where where
+                     :layout/kind (:layout/kind plan)
+                     :layout/scope (:layout/scope plan)
+                     :remedy "use (aos machine fields) — declaration order, no line padding"})))
+  plan)
