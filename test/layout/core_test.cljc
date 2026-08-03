@@ -192,3 +192,59 @@
             (l/field-errors [{:name :x :bytes 4 :align 3}])))
   (is (some #(= :invalid-field-bytes (:error %))
             (l/field-errors [{:name :x :bytes 0 :align 4}]))))
+
+;; ── roofline (calibrated against an Apple M1 Max, 2026-08-03) ─────────────
+
+(def m1max
+  "The measured descriptor `machine-probe` reads off this machine, reduced to
+  what `layout` uses. 128-byte lines, not the 64 of `portable-64`."
+  {:format m/format-id
+   :machine/id "Apple M1 Max/performance"
+   :machine/provenance :measured
+   :machine/source "sysctl -a (Darwin)"
+   :cpu {:arch :aarch64 :cores 8
+         :simd {:name :neon :width-bits 128}
+         :cache [{:level 1 :kind :data :bytes 131072 :line-bytes 128 :shared-by 1}
+                 {:level 2 :kind :unified :bytes 12582912 :line-bytes 128 :shared-by 4}]}
+   :page {:base-bytes 16384 :huge []}})
+
+(def wide
+  "Sixteen f64 fields, one of which the pass reads."
+  (mapv (fn [i] {:name (keyword (str "f" i)) :bytes 8 :align 8}) (range 16)))
+
+(deftest the-roofline-explains-the-measurement-the-byte-model-could-not
+  (let [n 2000000
+        access {:access/fields #{:f0} :access/stride 1}
+        r (l/achievable-ratio m1max
+                              {:baseline (l/aos m1max wide)
+                               :candidate (l/soa m1max wide)
+                               :n n :access access
+                               ;; Both measured on the machine: the SoA arm's
+                               ;; floor was 6.066 ms / 2e6 elements, and one
+                               ;; thread observed 18.5 GB/s on the AoS arm.
+                               :loop-ns-per-element 3.03
+                               :bandwidth-bytes-per-ns 18.5})]
+    (testing "the byte ratio is 16x, exactly as `cost` always said"
+      (is (= 16.0 (:bytes-ratio r))))
+    (testing "but SoA is loop-bound and AoS is memory-bound, so the ratio caps"
+      (is (= :memory (get-in r [:baseline :bound-by])))
+      (is (= :loop (get-in r [:candidate :bound-by])))
+      (is (not (:both-memory-bound? r))))
+    (testing "and the cap lands on the measured 2.28x, within a few percent"
+      (is (< 2.2 (:achievable-ratio r) 2.4)))
+    (testing "the predicted per-arm times match the measured 13.8 ms / 6.07 ms"
+      (is (< 13.5e6 (get-in r [:baseline :time-ns]) 14.2e6))
+      (is (< 5.9e6 (get-in r [:candidate :time-ns]) 6.2e6)))))
+
+(deftest a-slower-loop-would-let-the-full-byte-ratio-through
+  (testing "the bytes ratio is reachable only when both arms are memory-bound;
+            with a cheap enough loop it is"
+    (let [r (l/achievable-ratio m1max
+                                {:baseline (l/aos m1max wide)
+                                 :candidate (l/soa m1max wide)
+                                 :n 2000000
+                                 :access {:access/fields #{:f0} :access/stride 1}
+                                 :loop-ns-per-element 0.05
+                                 :bandwidth-bytes-per-ns 18.5})]
+      (is (:both-memory-bound? r))
+      (is (< 15.9 (:achievable-ratio r) 16.1)))))

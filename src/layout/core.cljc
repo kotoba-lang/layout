@@ -402,3 +402,55 @@
                      :layout/scope (:layout/scope plan)
                      :remedy "use (aos machine fields) — declaration order, no line padding"})))
   plan)
+
+;; ── from bytes to time ───────────────────────────────────────────────────
+
+(def roofline-model
+  {:model/id :kotoba.layout.roofline/v1
+   :model/rule "per-arm time = max(loop-ns-per-element * n, bytes-fetched / bandwidth)"
+   :model/assumes
+   ["a loop has a floor cost per element that no layout can remove"
+    "a machine delivers a finite bandwidth to the thread doing the fetching"
+    "the two overlap perfectly, so the slower one is the whole cost"]
+   :model/does-not-model [:latency-bound-random-access :nuca :contention-between-threads]})
+
+(defn achievable-ratio
+  "The speedup a layout change can actually deliver, in time rather than bytes.
+
+  `cost` counts bytes, and a bytes ratio is only realized as a time ratio when
+  BOTH arms are memory-bound. The moment one arm's per-element loop cost
+  exceeds its memory cost, that arm stops getting faster and the ratio is
+  capped — which is why a 16x line ratio measured 2.0x on the machine this was
+  written against, and why the surprise was in the question, not the answer.
+
+  `loop-ns-per-element` is the floor: the time the pass takes when its data is
+  already in registers. Measure it as the fastest arm's time divided by n.
+  `bandwidth-bytes-per-ns` is what one thread actually observes, not the
+  datasheet peak — those differ by more than an order of magnitude.
+
+  Both are measurements, so this returns a ceiling you can check against a
+  `perfgate` claim rather than a number to quote."
+  [machine {:keys [baseline candidate n access loop-ns-per-element bandwidth-bytes-per-ns]}]
+  (let [arm (fn [plan]
+              (let [c (cost machine plan n access)
+                    mem-ns (/ (double (:cost/bytes-fetched c)) bandwidth-bytes-per-ns)
+                    loop-ns (* loop-ns-per-element (double n))]
+                {:plan (:layout/kind plan)
+                 :bytes-fetched (:cost/bytes-fetched c)
+                 :memory-ns mem-ns
+                 :loop-ns loop-ns
+                 :time-ns (max mem-ns loop-ns)
+                 :bound-by (if (> mem-ns loop-ns) :memory :loop)}))
+        b (arm baseline)
+        c (arm candidate)]
+    {:format format-id
+     :baseline b
+     :candidate c
+     :bytes-ratio (double (/ (:bytes-fetched b) (:bytes-fetched c)))
+     :achievable-ratio (/ (:time-ns b) (:time-ns c))
+     ;; The whole point in one field. When this is false the bytes ratio is
+     ;; unreachable no matter how good the layout is, and a plan that promises
+     ;; it is promising something the loop will not allow.
+     :both-memory-bound? (= :memory (:bound-by b) (:bound-by c))
+     :model roofline-model
+     :machine (:machine/id machine)}))
