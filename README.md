@@ -111,7 +111,7 @@ widest field. For the particle on a 64-byte line: block 16, sub-arrays at
 ## Test
 
 ```sh
-clojure -M:test
+kbb -M:test
 ```
 
 Pure `.cljc`. Depends only on
